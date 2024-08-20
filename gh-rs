@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+
+set -e
+
+GITHUB_API_URL="https://api.github.com"
+GITHUB_GRAPHQL_URL="https://api.github.com/graphql"
+
+format_date() {
+    local timestamp=$1
+    if date -j -f "%s" "$timestamp" >/dev/null 2>&1; then
+        # macOS
+        date -j -f "%s" "$timestamp" "+%Y-%m-%d %H:%M:%S"
+    else
+        # Linux
+        date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S'
+    fi
+}
+
+
+print_usage() {
+    echo "Usage: gh repo-size <repository_url>... [--token <github_token>] [--unit <B|KB|MB|GB>] [--verbose] [--json] [--api-url <url>] [--full-size] [--debug]"
+    echo
+    echo "Options:"
+    echo "  --token     GitHub API token for private repositories"
+    echo "  --unit      Unit to display size in (default: MB)"
+    echo "  --verbose   Display additional repository information"
+    echo "  --json      Output results in JSON format"
+    echo "  --api-url   Custom GitHub API URL for enterprise instances"
+    echo "  --full-size Calculate the size of the entire repository (all branches and history)"
+    echo "  --debug     Enable debug mode for troubleshooting"
+}
+
+get_repo_size() {
+    local repo_url=$1
+    local token=$2
+    local unit=${3:-MB}
+    local api_url=${4:-$GITHUB_API_URL}
+    local full_size=$5
+    local debug=$6
+
+    local owner=$(echo "$repo_url" | sed -E 's|https://github.com/([^/]+)/.*|\1|')
+    local repo=$(echo "$repo_url" | sed -E 's|https://github.com/[^/]+/([^/]+).*|\1|')
+
+    $debug && echo "Debug: Parsed owner=$owner, repo=$repo" >&2
+
+    local size_kb=0
+    local language
+    local stars
+    local forks
+    local last_commit
+
+    if $full_size; then
+        $debug && echo "Debug: Calculating full repository size" >&2
+        
+        # Get all branches
+        local branches_url="$api_url/repos/$owner/$repo/branches?per_page=100"
+        local branches=$(curl -s -H "Authorization: token $token" "$branches_url")
+        
+        # Calculate total size
+        for branch in $(echo "$branches" | jq -r '.[].name'); do
+            local branch_url="$api_url/repos/$owner/$repo/git/trees/$branch?recursive=1"
+            local branch_data=$(curl -s -H "Authorization: token $token" "$branch_url")
+            local branch_size=$(echo "$branch_data" | jq '.tree[].size' | awk '{s+=$1} END {print s}')
+            size_kb=$((size_kb + branch_size / 1024))
+            $debug && echo "Debug: Branch $branch size: $branch_size bytes" >&2
+        done
+        
+        $debug && echo "Debug: Total size: $size_kb KB" >&2
+    else
+        # Use REST API for default branch size
+        local api_endpoint="$api_url/repos/$owner/$repo"
+        local response=$(curl -s -H "Authorization: token $token" "$api_endpoint")
+        
+        size_kb=$(echo "$response" | jq -r '.size')
+    fi
+
+    # Fetch other repository information
+    local repo_info=$(curl -s -H "Authorization: token $token" "$api_url/repos/$owner/$repo")
+    language=$(echo "$repo_info" | jq -r '.language')
+    stars=$(echo "$repo_info" | jq -r '.stargazers_count')
+    forks=$(echo "$repo_info" | jq -r '.forks_count')
+    last_commit=$(echo "$repo_info" | jq -r '.updated_at')
+
+    # Convert size to desired unit
+    local size
+    case ${unit^^} in
+        B)  size=$((size_kb * 1024)) ;;
+        KB) size=$size_kb ;;
+        MB) size=$(echo "scale=2; $size_kb / 1024" | bc) ;;
+        GB) size=$(echo "scale=2; $size_kb / 1024 / 1024" | bc) ;;
+        *)  echo "Invalid unit: $unit" >&2; return 1 ;;
+    esac
+
+    $debug && echo "Debug: Final size=$size $unit" >&2
+
+    echo "$repo_url|$size|$unit|$language|$stars|$forks|$last_commit"
+}
+
+
+
+
+
+main() {
+    local repos=()
+    local token=""
+    local unit="MB"
+    local verbose=false
+    local json_output=false
+    local api_url=$GITHUB_API_URL
+    local full_size=false
+    local debug=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --token) token=$2; shift 2 ;;
+            --unit)  unit=$2;  shift 2 ;;
+            --verbose) verbose=true; shift ;;
+            --json) json_output=true; shift ;;
+            --api-url) api_url=$2; shift 2 ;;
+            --full-size) full_size=true; shift ;;
+            --debug) debug=true; shift ;;
+            -h|--help) print_usage; exit 0 ;;
+            *) 
+                repos+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#repos[@]} -eq 0 ]]; then
+        echo "Error: At least one repository URL is required" >&2
+        print_usage
+        exit 1
+    fi
+
+    if [[ -z $token && -n $GITHUB_TOKEN ]]; then
+        token=$GITHUB_TOKEN
+    fi
+
+    if $debug; then
+        set -x
+    fi
+
+    local results=()
+    for repo in "${repos[@]}"; do
+        result=$(get_repo_size "$repo" "$token" "$unit" "$api_url" "$full_size" "$debug")
+        if [[ $? -eq 0 ]]; then
+            results+=("$result")
+        fi
+    done
+
+    if $json_output; then
+        echo "["
+        for i in "${!results[@]}"; do
+            IFS='|' read -r url size unit language stars forks last_commit <<< "${results[$i]}"
+            echo "  {"
+            echo "    \"url\": \"$url\","
+            echo "    \"size\": $size,"
+            echo "    \"unit\": \"$unit\","
+            echo "    \"language\": \"$language\","
+            echo "    \"stars\": $stars,"
+            echo "    \"forks\": $forks,"
+            echo "    \"last_commit\": \"$last_commit\""
+            echo "  }$([ $i -lt $((${#results[@]}-1)) ] && echo ",")"
+        done
+        echo "]"
+    else
+        for result in "${results[@]}"; do
+            IFS='|' read -r url size unit language stars forks last_commit <<< "$result"
+            if $verbose; then
+                echo -e "\e[1mRepository:\e[0m $url"
+                echo -e "\e[1mSize:\e[0m $size $unit"
+                echo -e "\e[1mPrimary Language:\e[0m $language"
+                echo -e "\e[1mStars:\e[0m $stars"
+                echo -e "\e[1mForks:\e[0m $forks"
+                echo -e "\e[1mLast Commit:\e[0m $last_commit"
+                echo
+            else
+                echo -e "\e[1m$url:\e[0m $size $unit"
+            fi
+        done
+    fi
+
+    # Display rate limit information
+    if [[ -n $token ]]; then
+        rate_limit=$(curl -s -H "Authorization: bearer $token" https://api.github.com/rate_limit)
+        remaining=$(echo "$rate_limit" | jq -r '.rate.remaining')
+        reset_time=$(echo "$rate_limit" | jq -r '.rate.reset')
+        reset_time_formatted=$(format_date "$reset_time")
+        echo -e "\n\e[33mAPI Rate Limit: $remaining requests remaining, resets at $reset_time_formatted\e[0m" >&2
+    fi
+}
+
+main "$@"
+
